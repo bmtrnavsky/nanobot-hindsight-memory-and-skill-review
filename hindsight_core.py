@@ -1024,3 +1024,580 @@ class HindsightError(RuntimeError):
 class DryRunResult:
     supported: bool
     facts: tuple[dict[str, Any], ...] = ()
+
+
+class HindsightClient:
+    """Small async wrapper around Hindsight's v0.8.6 REST surface."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._api_version: str | None = None
+        self._dry_run_supported: bool | None = None
+
+    def _require_automation_scope(self) -> None:
+        if not self.settings.automation_configured:
+            raise HindsightError(
+                "automatic Hindsight access requires an explicitly single-user gateway "
+                "and either NANOBOT_HINDSIGHT_USER_TAG or a single-user bank"
+            )
+
+    def _url(self, path: str) -> str:
+        bank = urllib.parse.quote(self.settings.bank_id, safe="")
+        return f"{self.settings.base_url}{path.format(bank_id=bank)}"
+
+    def _request_sync(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None,
+        timeout: int,
+    ) -> dict[str, Any]:
+        if not self.settings.configured:
+            raise HindsightError("Hindsight bank is not configured")
+        data = canonical_json(payload).encode("utf-8") if payload is not None else None
+        headers = {"Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        if self.settings.api_key:
+            headers["Authorization"] = f"Bearer {self.settings.api_key}"
+        request = urllib.request.Request(self._url(path), data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                parsed = json.loads(body) if body else {}
+                if not isinstance(parsed, dict):
+                    raise HindsightError("Hindsight returned a non-object response")
+                return parsed
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:2_000]
+            raise HindsightError(
+                f"Hindsight HTTP {exc.code}", status=exc.code, body=body
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise HindsightError(f"Hindsight connection failed: {exc.reason}") from exc
+        except json.JSONDecodeError as exc:
+            raise HindsightError("Hindsight returned invalid JSON") from exc
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        effective_timeout = timeout or self.settings.background_timeout_seconds
+        return await asyncio.to_thread(
+            self._request_sync, method, path, payload, effective_timeout
+        )
+
+    async def version(self) -> str:
+        if self._api_version is None:
+            response = await self._request("GET", "/version", timeout=self.settings.recall_timeout_seconds)
+            self._api_version = str(response.get("api_version") or response.get("version") or "unknown")
+        return self._api_version
+
+    async def recall(self, query: str) -> list[dict[str, Any]]:
+        self._require_automation_scope()
+        payload: dict[str, Any] = {
+            "query": clean_text(query, 2_000),
+            "types": ["world", "experience", "observation"],
+            "prefer_observations": True,
+            "budget": "low",
+            "max_tokens": self.settings.recall_max_tokens,
+            "include": {"entities": None},
+            "query_timestamp": utc_now(),
+        }
+        if self.settings.tags:
+            payload["tags"] = self.settings.tags
+            payload["tags_match"] = self.settings.tags_match
+        response = await self._request(
+            "POST",
+            "/v1/default/banks/{bank_id}/memories/recall",
+            payload,
+            timeout=self.settings.recall_timeout_seconds,
+        )
+        results = response.get("results") or []
+        return [item for item in results if isinstance(item, dict)]
+
+    async def dry_run_extract(self, content: str, context: str) -> DryRunResult:
+        if self._dry_run_supported is False:
+            return DryRunResult(supported=False)
+        mission = (
+            "Extract only durable user preferences or constraints; identity and people; "
+            "named projects and current commitments; explicitly stated health conditions, "
+            "diagnoses, medications, allergies, and providers; decisions and dated events "
+            "including health events; open issues; or a solution proven by successful "
+            "verification. Ignore greetings, research, sources, raw tool output, stack traces, "
+            "speculation, and temporary execution state."
+        )
+        payload = {
+            "content": clean_text(content, 5_000),
+            "context": clean_text(context, 1_000),
+            "timestamp": utc_now(),
+            "agent_name": "nanobot",
+            "retain_mission": mission,
+            "retain_extraction_mode": "concise",
+        }
+        try:
+            response = await self._request(
+                "POST",
+                "/v1/default/banks/{bank_id}/memories/dry-run-extract",
+                payload,
+            )
+        except HindsightError as exc:
+            if exc.status == 404:
+                self._dry_run_supported = False
+                return DryRunResult(supported=False)
+            raise
+        self._dry_run_supported = True
+        facts = response.get("facts") or []
+        return DryRunResult(
+            supported=True,
+            facts=tuple(fact for fact in facts if isinstance(fact, dict)),
+        )
+
+    async def retain(self, candidate: "Candidate", exchange: "Exchange") -> str:
+        self._require_automation_scope()
+        version = await self.version()
+        if parse_version(version) < MIN_HINDSIGHT_VERSION:
+            raise HindsightError(
+                f"Hindsight {version} is too old for this Retain integration; "
+                "v0.8.6 or newer is required"
+            )
+
+        def build_item(
+            *, content: str, document_id: str, category: str
+        ) -> dict[str, Any]:
+            item: dict[str, Any] = {
+                "content": content,
+                "context": (
+                    f"Nanobot durable-memory checkpoint. Source evidence "
+                    f"{exchange.evidence_id}. User statements are attributed to the "
+                    "user; assistant resolutions were accepted only when tool evidence "
+                    "verified them."
+                ),
+                "timestamp": exchange.observed_at,
+                "metadata": {
+                    "source": "nanobot-hindsight",
+                    "evidence_id": exchange.evidence_id,
+                    "category": category,
+                    "gate_version": str(SCHEMA_VERSION),
+                },
+                "document_id": document_id,
+                "tags": [*self.settings.tags, "kind:durable", f"category:{category}"],
+                "update_mode": "replace",
+            }
+            if self.settings.user_tag:
+                scopes: list[list[str]] = [[self.settings.user_tag]]
+                if self.settings.project_tag:
+                    scopes.append([self.settings.user_tag, self.settings.project_tag])
+                item["observation_scopes"] = scopes
+            elif self.settings.single_user_bank:
+                item["observation_scopes"] = "shared"
+            return item
+
+        async def store(item: dict[str, Any]) -> None:
+            response = await self._request(
+                "POST",
+                "/v1/default/banks/{bank_id}/memories",
+                {"items": [item], "async": False},
+            )
+            if not (
+                response.get("success") is True
+                and response.get("async") is False
+                and response.get("items_count") == 1
+            ):
+                raise HindsightError(
+                    "Hindsight did not confirm one synchronous Retain item",
+                    body=clean_text(response, 1_000),
+                )
+
+        # Close an earlier mutable open-issue document before storing the
+        # immutable resolution event.  If the second write fails, retrying is
+        # safe and the bank never remains stuck recalling an issue as open.
+        if candidate.category == "resolved_error":
+            issue_key = verified_issue_memory_key(exchange)
+            resolution = exchange.verified_resolution_sentence
+            if issue_key and resolution:
+                await store(
+                    build_item(
+                        content=(
+                            "Issue closed after verification: "
+                            f"{clean_text(resolution, 240)}"
+                        ),
+                        document_id=scoped_memory_document_id(
+                            self.settings, memory_document_id(issue_key)
+                        ),
+                        category="open_issue",
+                    )
+                )
+
+        document_id = scoped_memory_document_id(
+            self.settings, candidate.document_id
+        )
+        await store(
+            build_item(
+                content=candidate.content,
+                document_id=document_id,
+                category=candidate.category,
+            )
+        )
+        return document_id
+
+    async def operation(self, operation_id: str) -> dict[str, Any]:
+        operation = urllib.parse.quote(operation_id, safe="")
+        return await self._request(
+            "GET",
+            f"/v1/default/banks/{{bank_id}}/operations/{operation}",
+        )
+
+    async def reflect(self, query: str) -> str:
+        self._require_automation_scope()
+        payload: dict[str, Any] = {
+            "query": clean_text(query, 8_000),
+            "budget": "low",
+            "max_tokens": 1_200,
+            "include": {"facts": {}, "tool_calls": {"output": False}},
+            "apply_all_directives": True,
+        }
+        if self.settings.tags:
+            payload["tags"] = self.settings.tags
+            payload["tags_match"] = self.settings.tags_match
+        response = await self._request(
+            "POST", "/v1/default/banks/{bank_id}/reflect", payload
+        )
+        return clean_text(response.get("text"), 6_000)
+
+    async def reflect_structured(
+        self,
+        query: str,
+        response_schema: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run Reflect with a JSON schema and return only validated object output.
+
+        Reflect has no Nanobot tools, so this is the isolation boundary used by
+        the nightly reviewer.  The caller must still validate every returned
+        finding and memory candidate against its local evidence ledger.
+        """
+        self._require_automation_scope()
+        if not isinstance(response_schema, dict):
+            raise TypeError("response_schema must be a JSON-schema object")
+        if len(canonical_json(response_schema)) > 32_000:
+            raise ValueError("response_schema is too large")
+        payload: dict[str, Any] = {
+            "query": clean_text(query, 24_000),
+            "budget": "low",
+            "max_tokens": 1_800,
+            "include": {"facts": {}, "tool_calls": {"output": False}},
+            "apply_all_directives": False,
+            "response_schema": response_schema,
+        }
+        if self.settings.tags:
+            payload["tags"] = self.settings.tags
+            payload["tags_match"] = self.settings.tags_match
+        response = await self._request(
+            "POST", "/v1/default/banks/{bank_id}/reflect", payload
+        )
+        structured = response.get("structured_output")
+        if isinstance(structured, str):
+            try:
+                structured = json.loads(structured)
+            except json.JSONDecodeError as exc:
+                raise HindsightError(
+                    "Hindsight Reflect returned invalid structured JSON"
+                ) from exc
+        if not isinstance(structured, dict):
+            raise HindsightError(
+                "Hindsight Reflect did not return a structured object"
+            )
+        _validate_json_value(structured, response_schema)
+        return structured
+
+
+@dataclass
+class ToolEvent:
+    sequence: int
+    tool_name: str
+    call_id: str
+    status: str
+    args_fingerprint: str
+    excerpt: str = ""
+    skill_refs: list[str] = field(default_factory=list)
+
+
+_ISSUE_TERMS_RE = re.compile(
+    r"(?i)\b(?:bug|error|issue|broken|failing|failed|blocked|doesn.t work|unresolved)\b"
+)
+_RESOLUTION_TERMS_RE = re.compile(
+    r"(?i)\b(?:fixed|resolved|working now|passes|passed|verified|successful)\b"
+)
+_SPECULATIVE_RESOLUTION_RE = re.compile(
+    r"(?i)\b(?:apparently|appears?|could|if|likely|may|might|perhaps|possible|"
+    r"possibly|potential|probably|seems?|should|try|untested)\b"
+)
+_NEGATED_RESOLUTION_RE = re.compile(
+    r"(?i)(?:\b(?:can.t|cannot|didn.t|failed to|isn.t|not|wasn.t|won.t)\b"
+    r".{0,32}\b(?:fixed|resolved|working|passes|passed|verified|successful)\b|"
+    r"\b(?:unresolved|persists?|remains?)\b|"
+    r"\bstill\s+(?:blocked|broken|failing)\b|"
+    r"\b(?:but|however)\b.{0,80}\b(?:blocked|broken|failing|failed|issue|"
+    r"persists?|remains?|unresolved)\b|"
+    r"\b(?:current|latest|now)\b.{0,48}\b(?:blocked|broken|failed|failing|"
+    r"persists?|unresolved)\b)"
+)
+_CONTRAST_RESOLUTION_RE = re.compile(
+    r"(?i)\b(?:although|but|except|however|though|yet)\b"
+)
+_RESOLUTION_STOP_WORDS = {
+    "assistant", "blocked", "broken", "bug", "error", "failed", "failing",
+    "fixed", "issue", "passed", "passes", "resolved", "successful", "test",
+    "tests", "the", "this", "unresolved", "user", "verified", "working",
+}
+
+
+def _resolution_topic_tokens(text: str) -> set[str]:
+    return {
+        _normalize_topic_token(token)
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", text.lower())
+        if _normalize_topic_token(token) not in _RESOLUTION_STOP_WORDS
+    }
+
+
+def _is_current_issue_sentence(sentence: str) -> bool:
+    lowered = sentence.lower().replace("’", "'")
+    direct_inability = bool(
+        re.search(
+            r"\bi\s+(?:cannot|can't)\s+(?:log\s+in|.{0,60}\b(?:connect|open|"
+            r"run|start|get\s+.{0,30}\s+to\s+work|work)\b)",
+            lowered,
+        )
+    )
+    if not _ISSUE_TERMS_RE.search(sentence) and not direct_inability:
+        return False
+    if _QUESTION_RE.search(sentence) or re.match(
+        r"^\s*(?:please\s+)?(?:analyze|check|explain|find|fix|inspect|investigate|"
+        r"research|review|search|summarize|test)\b",
+        lowered,
+    ):
+        return False
+    if re.search(
+        r"(?i)\b(?:never saw|did not see|didn.t see|haven.t seen|no longer|without)\b"
+        r".{0,40}\b(?:bug|error|issue|failure)\b",
+        sentence,
+    ):
+        return False
+    if re.search(
+        r"(?i)\b(?:bug|error|issue|failure)\b.{0,32}"
+        r"\b(?:isn.t present|not present|no longer|was resolved)\b",
+        sentence,
+    ):
+        return False
+    if _RESOLUTION_TERMS_RE.search(sentence) and not re.search(
+        r"(?i)\b(?:blocked|failed|failing|persists?|returned|unresolved)\b", sentence
+    ):
+        return False
+    return True
+
+
+def _is_affirmative_resolution_sentence(sentence: str) -> bool:
+    if "?" in sentence:
+        return False
+    if not _RESOLUTION_TERMS_RE.search(sentence):
+        return False
+    if (
+        _SPECULATIVE_RESOLUTION_RE.search(sentence)
+        or _NEGATED_RESOLUTION_RE.search(sentence)
+        or _CONTRAST_RESOLUTION_RE.search(sentence)
+    ):
+        return False
+    if re.search(r"(?i)\bpass(?:ed|es)\b", sentence) and not re.search(
+        r"(?i)(?:\b(?:tests?|checks?|verification|build|suite)\b.{0,40}"
+        r"\bpass(?:ed|es)\b|\bpass(?:ed|es)\b.{0,40}"
+        r"\b(?:tests?|checks?|verification|build|suite)\b)",
+        sentence,
+    ):
+        # "The issue was passed to another team" is a hand-off, not a fix.
+        if not re.search(r"(?i)\b(?:fixed|resolved|successful|verified|working now)\b", sentence):
+            return False
+    return True
+
+
+def _tool_can_verify_resolution(tool_name: str) -> bool:
+    """Reject read/research tools whose recovery cannot prove the task was fixed."""
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", clean_text(tool_name, 100).lower())
+        if token
+    }
+    non_verifying = {
+        "browse", "browser", "fetch", "find", "open", "read", "recall",
+        "reflect", "search", "view", "web",
+    }
+    return bool(tokens) and not tokens.intersection(non_verifying)
+
+
+@dataclass
+class Exchange:
+    evidence_id: str
+    session_key: str
+    observed_at: str
+    user_text: str
+    assistant_final: str
+    tool_events: list[ToolEvent]
+    source: str = "session_history"
+    coverage: str = "public_only"
+
+    @property
+    def skill_refs(self) -> set[str]:
+        refs: set[str] = set()
+        for event in self.tool_events:
+            refs.update(event.skill_refs)
+        return refs
+
+    @property
+    def has_tool_error(self) -> bool:
+        return any(event.status == "error" for event in self.tool_events)
+
+    @property
+    def has_verified_success(self) -> bool:
+        return any(event.status == "success" for event in self.tool_events)
+
+    @property
+    def verified_resolution_sentence(self) -> str | None:
+        has_matching_verification = any(
+            success.sequence > failure.sequence
+            and success.tool_name != "unknown"
+            and _tool_can_verify_resolution(success.tool_name)
+            and success.tool_name == failure.tool_name
+            and success.args_fingerprint == failure.args_fingerprint
+            for failure in self.tool_events
+            if failure.status == "error"
+            for success in self.tool_events
+            if success.status == "success"
+        )
+        if not has_matching_verification:
+            return None
+        issue_sentences = [
+            sentence
+            for sentence in _sentences(self.user_text)
+            if _is_current_issue_sentence(sentence)
+        ]
+        if not issue_sentences:
+            return None
+        issue_topics = [
+            _resolution_topic_tokens(sentence) for sentence in issue_sentences
+        ]
+        candidates: list[tuple[int, int, str]] = []
+        for index, sentence in enumerate(_sentences(self.assistant_final)):
+            if not _is_affirmative_resolution_sentence(sentence):
+                continue
+            sentence_topics = _resolution_topic_tokens(sentence)
+            overlap = max(
+                (len(sentence_topics.intersection(topic)) for topic in issue_topics),
+                default=0,
+            )
+            if overlap:
+                candidates.append((overlap, -index, sentence))
+        return max(candidates)[2] if candidates else None
+
+    @property
+    def verified_resolution(self) -> bool:
+        return self.verified_resolution_sentence is not None
+
+
+@dataclass
+class Candidate:
+    candidate_id: str
+    evidence_id: str
+    category: str
+    content: str
+    memory_key: str | None
+    confidence: float
+    verified: bool
+    sensitivity: str = "normal"
+    status: str = "proposed"
+    reason: str = ""
+    operation_id: str | None = None
+
+    @property
+    def document_id(self) -> str:
+        if self.memory_key:
+            return memory_document_id(self.memory_key)
+        return f"nanobot:event:{self.candidate_id[:32]}"
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        exchange: Exchange,
+        category: str,
+        content: str,
+        confidence: float,
+        verified: bool,
+        memory_key: str | None = None,
+        derive_key: bool = False,
+    ) -> "Candidate":
+        normalized = clean_text(content, 280)
+        if derive_key and category in MUTABLE_CATEGORIES and not memory_key:
+            memory_key = derive_memory_key(category, normalized)
+        candidate_id = stable_hash(
+            {
+                "evidence_id": exchange.evidence_id,
+                "category": category,
+                "content": normalized.lower(),
+                "memory_key": memory_key,
+            }
+        )
+        return cls(
+            candidate_id=candidate_id,
+            evidence_id=exchange.evidence_id,
+            category=category,
+            content=normalized,
+            memory_key=memory_key,
+            confidence=confidence,
+            verified=verified,
+        )
+
+
+def derive_memory_key(category: str, text: str) -> str:
+    words = [
+        word.lower()
+        for word in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", text)
+        if word.lower()
+        not in {
+            "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "is",
+            "are", "was", "were", "user", "stated", "that", "this", "my", "i",
+        }
+    ]
+    topic = ".".join(words[:8]) or stable_hash(text)[:16]
+    return f"{category}.{topic}"
+
+
+def memory_document_id(memory_key: str) -> str:
+    """Map a canonical key to a compact, collision-resistant document ID."""
+    return (
+        f"nanobot:durable:{slug(memory_key, 60)}:"
+        f"{stable_hash(memory_key)[:16]}"
+    )
+
+
+def scoped_memory_document_id(settings: Settings, logical_document_id: str) -> str:
+    """Namespace a Hindsight document upsert to one configured user scope."""
+    scope = {
+        "bank_id": settings.bank_id,
+        "user_tag": settings.user_tag or "single-user-bank",
+        "project_tag": settings.project_tag or "",
+    }
+    return f"{logical_document_id}:scope:{stable_hash(scope)[:16]}"
+
+
+def _memory_key_error(category: str, memory_key: str | None) -> str | None:
+    value = memory_key or ""
+    if len(value) > 96 or not re.fullmatch(
+        rf"{re.escape(category)}\.[a-z0-9][a-z0-9._-]+",
+        value,
+    ):
+        return "mutable memory_key must be category-namespaced and canonical"
+    if slug(value, 96) != value:
+        return "mutable memory_key must not contain repeated or trailing punctuation"
+    return None
