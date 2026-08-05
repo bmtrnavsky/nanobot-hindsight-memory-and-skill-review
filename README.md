@@ -1,5 +1,7 @@
 # Nanobot Hindsight automation
 
+A [Nanobot](https://github.com) plugin that gives your agent governed long-term memory through [Hindsight](https://github.com) — selective Recall and Retain, not a raw memory dump — plus an automated nightly review that surfaces missing or broken skills using Hindsight Reflect. Built for a single-user Nanobot gateway, fail-closed by design, and secret-redacted at every network boundary.
+
 This is a thin tool plugin, audited against Nanobot v0.3.0, for selective Hindsight memory and nightly skill review. Dream stays disabled. The plugin does not rewrite `MEMORY.md`, `SOUL.md`, `AGENTS.md`, `TOOLS.md`, or live skills. It reads each installed `SKILL.md` locally to derive a name, description, path, and content hash; only those metadata fields are sent to the reviewer.
 
 It provides:
