@@ -571,3 +571,255 @@ _MEMORY_OPT_OUT_PATTERNS = (
     ),
     re.compile(
         r"(?i)^\s*(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?forget\s+"
+        r"(?:anything|everything|my\b|this|that|it|the\s+following|what\s+follows|"
+        r"what\s+i\s+(?:said|say|wrote))"
+    ),
+    re.compile(
+        r"(?i)(?:^|[.!?]\s+)(?:and\s+)?(?:please\s+)?forget\s+"
+        r"(?:anything|everything|my\b|this|that|it|the\s+following|what\s+follows|"
+        r"what\s+i\s+(?:said|say|wrote))"
+    ),
+    re.compile(r"(?i)\boff[\s-]+the[\s-]+record\b"),
+    re.compile(
+        r"(?i)\b(?:this|that|it)\s+(?:(?:is|was)\s+not|"
+        r"isn['’]?t|wasn['’]?t)\s+for\s+(?:memory|retention|storage)\b"
+    ),
+    re.compile(
+        r"(?i)\bkeep\s+(?:this|that|it|the\s+following)\s+out\s+of\s+"
+        r"(?:memory|storage)\b"
+    ),
+    re.compile(
+        r"(?i)(?:^|[.!?]\s+)(?:and\s+)?(?:please\s+)?"
+        r"(?:(?:do\s+not|don['’]?t|never)\s+include|exclude)\s+"
+        r"(?:this|that|it|the\s+following)\s+(?:in|from)\s+"
+        r"(?:memory|storage)\b"
+    ),
+    re.compile(
+        r"(?i)(?:^|[.!?]\s+)(?:and\s+)?(?:please\s+)?"
+        r"(?:do\s+not|don['’]?t|never)\s+use\s+"
+        r"(?:this|that|it|the\s+following)\s+(?:as|for)\s+"
+        r"(?:memory|storage)\b"
+    ),
+)
+
+
+def memory_opt_out(text: str) -> bool:
+    """Whether the user explicitly prohibited this message from memory storage."""
+    normalized = clean_text(text, 4_000)
+    return any(pattern.search(normalized) for pattern in _MEMORY_OPT_OUT_PATTERNS)
+
+
+_TRANSFORMED_CONTENT_FRAMING_RE = re.compile(
+    r"(?im)^\s*(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?"
+    r"(?:clean\s+up|convert|copyedit|edit|paraphrase|"
+    r"polish|proofread|reformat|rewrite|summarize|translate|"
+    r"review\s+(?:this|the)|fix\s+(?:this|the)?\s*(?:grammar|wording))\b"
+    r"[^\n:]{0,120}(?::\s*|\n|[.?!]\s+)|"
+    r"^\s*here\s+is\s+(?:the\s+)?(?:text|sentence|draft|content)\s+to\s+"
+    r"(?:clean\s+up|convert|copyedit|edit|paraphrase|polish|proofread|reformat|"
+    r"rewrite|summarize|translate)\b[^\n:]{0,80}(?::\s*|\n|[.?!]\s+)"
+)
+
+
+def has_transformed_content_framing(text: str) -> bool:
+    """Whether following text is material to transform, not a user assertion."""
+    return bool(_TRANSFORMED_CONTENT_FRAMING_RE.search(clean_text(text, 4_000)))
+
+
+_TRANSIENT_MEMORY_SCOPE_RE = re.compile(
+    r"(?i)\b(?:for|in|on|during)\s+(?:just\s+)?(?:this|that)(?:\s+one)?\s+"
+    r"[a-z][a-z0-9_-]*(?:\s+[a-z][a-z0-9_-]*){0,2}\b"
+)
+_TEMPORARY_MEMORY_TIME_RE = re.compile(
+    r"(?i)\b(?:for\s+now|temporarily|today|tonight|this\s+(?:session|week|month)|"
+    r"just\s+this\s+once|for\s+this\s+one|right\s+now|at\s+the\s+moment|"
+    r"for\s+the\s+time\s+being|in\s+this\s+conversation|on\s+this\s+occasion|"
+    r"for\s+the\s+next\s+(?:\d+|a|an|one|two|few)?\s*"
+    r"(?:minutes?|hours?|days?|weeks?|months?)|until\s+[^,.!?;]{2,40}|"
+    r"while\s+[^,.!?;]{2,80})\b"
+)
+
+
+def has_transient_memory_scope(text: str) -> bool:
+    """Reject deictic one-turn/task scopes that cannot safely become global state."""
+    normalized = clean_text(text, 1_000)
+    return bool(
+        _TRANSIENT_MEMORY_SCOPE_RE.search(normalized)
+        or _TEMPORARY_MEMORY_TIME_RE.search(normalized)
+    )
+
+
+_NONASSERTIVE_MEMORY_RE = re.compile(
+    r"(?i)^\s*(?:for\s+example|e\.g\.|maybe|perhaps|possibly|hypothetically|"
+    r"imagine|assume|consider(?:\s+that)?|suppose|assuming|if\b|"
+    r"i\s+(?:think|guess|imagine|wonder|am\s+not\s+sure)\b)|"
+    r"\b(?:apparently|appears?|maybe|ostensibly|perhaps|possibly|probably|"
+    r"reportedly|seems?|supposedly|likely)\b|"
+    r"\bi\s+suppose\s*[.!?]?$|"
+    r"\b(?:might|may(?!\s+\d{1,2}\b)|could|would)\b|"
+    r"\b(?:try|tries|trying|tried|attempt|attempts|attempting|attempted|hope|hopes|"
+    r"hoping|hoped)\s+to\b|"
+    r"\b(?:if|unless|provided\s+that|assuming(?:\s+that)?|depending\s+on)\b"
+)
+
+
+def is_nonassertive_memory_statement(text: str) -> bool:
+    """Whether a sentence is conditional, speculative, or explicitly uncertain."""
+    return bool(_NONASSERTIVE_MEMORY_RE.search(clean_text(text, 1_000)))
+
+
+_HISTORICAL_MEMORY_RE = re.compile(
+    r"(?i)\b(?:used\s+to|formerly|previously|yesterday|last\s+"
+    r"(?:week|month|year)|was|were)\b"
+)
+
+
+def is_historical_memory_statement(text: str) -> bool:
+    """Whether mutable wording describes prior rather than current state."""
+    return bool(_HISTORICAL_MEMORY_RE.search(clean_text(text, 1_000)))
+
+
+def slug(value: str, limit: int = 96) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9._-]+", ".", value)
+    value = re.sub(r"\.{2,}", ".", value).strip(".-_")
+    return (value or "item")[:limit]
+
+
+def parse_version(value: str | None) -> tuple[int, ...]:
+    if not value:
+        return ()
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
+    return tuple(int(part) for part in match.groups()) if match else ()
+
+
+def _schema_type_matches(value: Any, expected: str) -> bool:
+    return {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "boolean": isinstance(value, bool),
+        "null": value is None,
+    }.get(expected, False)
+
+
+def _validate_json_value(
+    value: Any,
+    schema: dict[str, Any],
+    path: str = "$",
+    depth: int = 0,
+) -> None:
+    """Validate the bounded JSON-Schema subset used by nightly Reflect."""
+    if depth > 20:
+        raise HindsightError("structured Reflect output exceeds schema nesting limit")
+    if not isinstance(schema, dict):
+        raise HindsightError(f"invalid response schema at {path}")
+
+    for keyword in ("allOf", "anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if branches is None:
+            continue
+        if not isinstance(branches, list) or not branches:
+            raise HindsightError(f"invalid {keyword} schema at {path}")
+        matches = 0
+        for branch in branches:
+            try:
+                _validate_json_value(value, branch, path, depth + 1)
+            except HindsightError:
+                continue
+            matches += 1
+        if keyword == "allOf" and matches != len(branches):
+            raise HindsightError(f"structured Reflect output violates allOf at {path}")
+        if keyword == "anyOf" and matches == 0:
+            raise HindsightError(f"structured Reflect output violates anyOf at {path}")
+        if keyword == "oneOf" and matches != 1:
+            raise HindsightError(f"structured Reflect output violates oneOf at {path}")
+
+    if "const" in schema and value != schema["const"]:
+        raise HindsightError(f"structured Reflect output violates const at {path}")
+    if "enum" in schema:
+        enum = schema["enum"]
+        if not isinstance(enum, list) or value not in enum:
+            raise HindsightError(f"structured Reflect output violates enum at {path}")
+
+    expected = schema.get("type")
+    if expected is not None:
+        expected_types = [expected] if isinstance(expected, str) else expected
+        if (
+            not isinstance(expected_types, list)
+            or not expected_types
+            or not all(isinstance(item, str) for item in expected_types)
+        ):
+            raise HindsightError(f"invalid type schema at {path}")
+        if not any(_schema_type_matches(value, item) for item in expected_types):
+            raise HindsightError(f"structured Reflect output has wrong type at {path}")
+
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        if not isinstance(required, list) or not all(
+            isinstance(item, str) for item in required
+        ):
+            raise HindsightError(f"invalid required schema at {path}")
+        missing = [item for item in required if item not in value]
+        if missing:
+            raise HindsightError(
+                f"structured Reflect output is missing {missing[0]!r} at {path}"
+            )
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):
+            raise HindsightError(f"invalid properties schema at {path}")
+        additional = schema.get("additionalProperties", True)
+        for key, item in value.items():
+            child_path = f"{path}.{key}"
+            if key in properties:
+                _validate_json_value(item, properties[key], child_path, depth + 1)
+            elif additional is False:
+                raise HindsightError(
+                    f"structured Reflect output has unexpected field {key!r} at {path}"
+                )
+            elif isinstance(additional, dict):
+                _validate_json_value(item, additional, child_path, depth + 1)
+        minimum = schema.get("minProperties")
+        maximum = schema.get("maxProperties")
+        if isinstance(minimum, int) and len(value) < minimum:
+            raise HindsightError(f"structured Reflect output has too few fields at {path}")
+        if isinstance(maximum, int) and len(value) > maximum:
+            raise HindsightError(f"structured Reflect output has too many fields at {path}")
+
+    if isinstance(value, list):
+        minimum = schema.get("minItems")
+        maximum = schema.get("maxItems")
+        if isinstance(minimum, int) and len(value) < minimum:
+            raise HindsightError(f"structured Reflect output has too few items at {path}")
+        if isinstance(maximum, int) and len(value) > maximum:
+            raise HindsightError(f"structured Reflect output has too many items at {path}")
+        item_schema = schema.get("items")
+        if item_schema is not None:
+            if not isinstance(item_schema, dict):
+                raise HindsightError(f"invalid items schema at {path}")
+            for index, item in enumerate(value):
+                _validate_json_value(item, item_schema, f"{path}[{index}]", depth + 1)
+
+    if isinstance(value, str):
+        minimum = schema.get("minLength")
+        maximum = schema.get("maxLength")
+        if isinstance(minimum, int) and len(value) < minimum:
+            raise HindsightError(f"structured Reflect output string is too short at {path}")
+        if isinstance(maximum, int) and len(value) > maximum:
+            raise HindsightError(f"structured Reflect output string is too long at {path}")
+        if "pattern" in schema:
+            try:
+                matches = re.search(str(schema["pattern"]), value)
+            except re.error as exc:
+                raise HindsightError(f"invalid pattern schema at {path}") from exc
+            if not matches:
+                raise HindsightError(f"structured Reflect output violates pattern at {path}")
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(value):
+            raise HindsightError(f"structured Reflect output is not finite at {path}")
+        if "minimum" in schema and value < schema["minimum"]:
+            raise HindsightError(f"structured Reflect output is below minimum at {path}")
+        if "maximum" in schema and value > schema["maximum"]:
